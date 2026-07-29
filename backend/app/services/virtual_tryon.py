@@ -1,9 +1,16 @@
 import os
-import cv2
-import numpy as np
+import io
 import base64
 import logging
 from abc import ABC, abstractmethod
+import numpy as np
+from PIL import Image
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
 from app.utils.image_utils import encode_image_to_base64_data_url
 
 logger = logging.getLogger("virtual_tryon")
@@ -11,9 +18,9 @@ logger = logging.getLogger("virtual_tryon")
 
 class VirtualTryOnProvider(ABC):
     @abstractmethod
-    def generate(self, img_bgr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
+    def generate(self, img_arr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
         """
-        Takes input user image (BGR numpy array), target hairstyle name and prompt hint,
+        Takes input user image (numpy array), target hairstyle name and prompt hint,
         and returns a base64 data URL string of the result image.
         """
         pass
@@ -29,7 +36,7 @@ class GroqVirtualTryOnProvider(VirtualTryOnProvider):
         from groq import Groq
         self.client = Groq(api_key=api_key)
 
-    def generate(self, img_bgr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
+    def generate(self, img_arr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
         try:
             prompt = (
                 f"Virtual Hairstyle Advisor transformation: Preserve person identity, face shape, skin tone, "
@@ -37,7 +44,6 @@ class GroqVirtualTryOnProvider(VirtualTryOnProvider):
                 f"Ensure photorealistic hair strands, natural hairline, realistic lighting and shadows."
             )
 
-            # Perform Groq completions API call
             completion = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -53,15 +59,13 @@ class GroqVirtualTryOnProvider(VirtualTryOnProvider):
             )
 
             logger.info(f"Groq completions successfully generated for model {self.model}")
-            
-            # Combine Groq styling response with high-fidelity local rendering
             mock_renderer = MockVirtualTryOnProvider()
-            return mock_renderer.generate(img_bgr, hairstyle_name, prompt_hint)
+            return mock_renderer.generate(img_arr, hairstyle_name, prompt_hint)
 
         except Exception as e:
             logger.warning(f"Groq API call error: {str(e)}. Falling back to local renderer.")
             fallback = MockVirtualTryOnProvider()
-            return fallback.generate(img_bgr, hairstyle_name, prompt_hint)
+            return fallback.generate(img_arr, hairstyle_name, prompt_hint)
 
 
 class OpenAIVirtualTryOnProvider(VirtualTryOnProvider):
@@ -73,12 +77,18 @@ class OpenAIVirtualTryOnProvider(VirtualTryOnProvider):
         import openai
         self.client = openai.OpenAI(api_key=api_key)
 
-    def generate(self, img_bgr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
+    def generate(self, img_arr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
         try:
-            success, encoded_image = cv2.imencode(".jpg", img_bgr)
-            if not success:
-                raise ValueError("Failed to encode input image for API request.")
-            image_bytes = encoded_image.tobytes()
+            if cv2 is not None:
+                success, encoded_image = cv2.imencode(".jpg", img_arr)
+                if not success:
+                    raise ValueError("Failed to encode input image for API request.")
+                image_bytes = encoded_image.tobytes()
+            else:
+                img_pil = Image.fromarray(img_arr)
+                buf = io.BytesIO()
+                img_pil.save(buf, format="JPEG")
+                image_bytes = buf.getvalue()
 
             prompt = (
                 f"Photorealistic hairstyle virtual try-on edit. Keep the exact same person, face, facial features, "
@@ -101,16 +111,19 @@ class OpenAIVirtualTryOnProvider(VirtualTryOnProvider):
         except Exception as e:
             logger.warning(f"OpenAI Virtual Try-On API call failed/unsupported: {str(e)}. Falling back to local renderer.")
             fallback = MockVirtualTryOnProvider()
-            return fallback.generate(img_bgr, hairstyle_name, prompt_hint)
+            return fallback.generate(img_arr, hairstyle_name, prompt_hint)
 
 
 class MockVirtualTryOnProvider(VirtualTryOnProvider):
     """
-    High-quality local Virtual Try-On renderer.
+    Local Virtual Try-On renderer.
     """
-    def generate(self, img_bgr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
-        h, w, c = img_bgr.shape
-        output = img_bgr.copy()
+    def generate(self, img_arr: np.ndarray, hairstyle_name: str, prompt_hint: str = "") -> str:
+        if cv2 is None:
+            return encode_image_to_base64_data_url(img_arr, ".jpg")
+
+        h, w, c = img_arr.shape
+        output = img_arr.copy()
 
         style_hash = abs(hash(hairstyle_name)) % 5
         palettes = [
@@ -167,7 +180,7 @@ class MockVirtualTryOnProvider(VirtualTryOnProvider):
         hair_mask_blur = cv2.GaussianBlur(hair_mask, (31, 31), 0)
         alpha = (hair_mask_blur / 255.0)[:, :, np.newaxis]
 
-        hair_canvas = np.zeros_like(img_bgr)
+        hair_canvas = np.zeros_like(img_arr)
         hair_canvas[:] = base_color
 
         for i in range(15):
@@ -178,7 +191,6 @@ class MockVirtualTryOnProvider(VirtualTryOnProvider):
             cv2.line(hair_canvas, (x1, y1), (x2, y2), highlight_color, thickness=2, lineType=cv2.LINE_AA)
 
         output = (output * (1.0 - alpha * 0.70) + hair_canvas * (alpha * 0.70)).astype(np.uint8)
-        output = cv2.detailEnhance(output, sigma_s=10, sigma_r=0.15)
 
         return encode_image_to_base64_data_url(output, ".jpg")
 

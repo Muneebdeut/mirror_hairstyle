@@ -1,20 +1,25 @@
 """
 Hair Analysis Service.
-
-Detection priority:
-  1. Groq Vision API (qwen/qwen3.6-27b) — uses AI vision to predict hair length, texture, density, and volume.
-  2. OpenCV texture & edge analysis — fallback heuristics.
+Analyzes hair characteristics (length, texture, density, volume)
+from an input image using Groq Vision model (qwen/qwen3.6-27b).
 """
 
+import io
 import base64
-import cv2
 import json
 import logging
+import os
 import re
-from typing import Optional, Tuple, Dict, Any
 
+from typing import Dict, Optional
 import numpy as np
+from PIL import Image
 from groq import Groq
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 from app.models.schemas import HairAnalysisResponse, HairCharacteristics
 
@@ -36,7 +41,7 @@ _VISION_PROMPT = (
     "2. hair_texture: Exactly one of [Straight, Wavy, Curly, Coily]\n"
     "3. hair_density: Exactly one of [Low, Medium, High]\n"
     "4. hair_volume: Exactly one of [Low, Medium, High]\n\n"
-    "Return ONLY a JSON object in this format:\n"
+    "Respond ONLY with valid JSON in this exact structure:\n"
     "{\n"
     '  "hair_length": "Short",\n'
     '  "hair_texture": "Wavy",\n'
@@ -55,14 +60,24 @@ def _get_groq_client() -> Groq:
     return _groq_client
 
 
-def _encode_image(img_bgr: np.ndarray) -> str:
+def _encode_image(img_arr: np.ndarray) -> str:
     """Encodes image to base64 JPEG string (max width 800px)."""
-    h, w = img_bgr.shape[:2]
-    if w > 800:
-        scale = 800 / w
-        img_bgr = cv2.resize(img_bgr, (800, int(h * scale)), interpolation=cv2.INTER_AREA)
-    _, buf = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return base64.b64encode(buf.tobytes()).decode()
+    if cv2 is not None and isinstance(img_arr, np.ndarray):
+        h, w = img_arr.shape[:2]
+        if w > 800:
+            scale = 800 / w
+            img_arr = cv2.resize(img_arr, (800, int(h * scale)), interpolation=cv2.INTER_AREA)
+        _, buf = cv2.imencode(".jpg", img_arr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf.tobytes()).decode()
+
+    # PIL fallback
+    img_pil = Image.fromarray(img_arr)
+    if img_pil.width > 800:
+        scale = 800 / img_pil.width
+        img_pil = img_pil.resize((800, int(img_pil.height * scale)), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img_pil.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def _parse_hair_json(text: str) -> Optional[Dict[str, str]]:
@@ -71,146 +86,86 @@ def _parse_hair_json(text: str) -> Optional[Dict[str, str]]:
         clean = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         clean = re.sub(r"```(?:json)?", "", clean).strip()
 
-        # Find JSON object bounds
         start_idx = clean.find("{")
         end_idx = clean.rfind("}")
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
             json_str = clean[start_idx : end_idx + 1]
             data = json.loads(json_str)
 
-            length = str(data.get("hair_length", "")).strip().title()
-            texture = str(data.get("hair_texture", "")).strip().title()
-            density = str(data.get("hair_density", "")).strip().title()
-            volume = str(data.get("hair_volume", "")).strip().title()
+            length = str(data.get("hair_length", "")).strip().lower()
+            texture = str(data.get("hair_texture", "")).strip().lower()
+            density = str(data.get("hair_density", "")).strip().lower()
+            volume = str(data.get("hair_volume", "")).strip().lower()
 
             res = {}
-            if length.lower() in _VALID_LENGTHS:
-                res["hair_length"] = length
-            if texture.lower() in _VALID_TEXTURES:
-                res["hair_texture"] = texture
-            if density.lower() in _VALID_DENSITIES:
-                res["hair_density"] = density
-            if volume.lower() in _VALID_VOLUMES:
-                res["hair_volume"] = volume
+            if length in _VALID_LENGTHS:
+                res["hair_length"] = length.title()
+            if texture in _VALID_TEXTURES:
+                res["hair_texture"] = texture.title()
+            if density in _VALID_DENSITIES:
+                res["hair_density"] = density.title()
+            if volume in _VALID_VOLUMES:
+                res["hair_volume"] = volume.title()
 
-            if len(res) >= 2:  # If at least 2 fields matched correctly
+            if len(res) == 4:
                 return res
+
     except Exception as e:
-        logger.warning(f"[Hair Vision API] Failed to parse JSON response: {e}")
-
-    return None
-
-
-def _analyze_via_groq_vision(img_bgr: np.ndarray) -> Optional[HairCharacteristics]:
-    """Calls Groq Vision API to predict hair characteristics."""
-    try:
-        b64 = _encode_image(img_bgr)
-        client = _get_groq_client()
-        resp = client.chat.completions.create(
-            model=_VISION_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": _VISION_PROMPT},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                ],
-            }],
-            max_completion_tokens=1024,
-            temperature=0.1,
-        )
-        raw = resp.choices[0].message.content or ""
-        parsed = _parse_hair_json(raw)
-        if parsed:
-            logger.info(f"[Hair Vision API] Hair analysis successful: {parsed}")
-            return HairCharacteristics(
-                hair_length=parsed.get("hair_length", "Medium"),
-                hair_texture=parsed.get("hair_texture", "Wavy"),
-                hair_density=parsed.get("hair_density", "Medium"),
-                hair_volume=parsed.get("hair_volume", "Medium"),
-            )
-    except Exception as e:
-        logger.error(f"[Hair Vision API] Error during analysis: {e}")
+        logger.warning(f"Error parsing hair analysis JSON: {e}")
 
     return None
 
 
 class HairAnalysisService:
-    def analyze_hair(self, img_bgr: Optional[np.ndarray]) -> HairAnalysisResponse:
-        """
-        Analyzes hair region characteristics using Groq Vision API (primary)
-        or OpenCV texture heuristics (fallback).
-        """
-        if img_bgr is not None:
-            # Tier 1: Groq Vision API Prediction
-            vision_result = _analyze_via_groq_vision(img_bgr)
-            if vision_result is not None:
+    def analyze_hair(self, img_arr: np.ndarray) -> HairAnalysisResponse:
+        try:
+            b64_img = _encode_image(img_arr)
+            client = _get_groq_client()
+
+            response = client.chat.completions.create(
+                model=_VISION_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": _VISION_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{b64_img}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.1,
+                max_completion_tokens=1024,
+            )
+
+            raw_text = response.choices[0].message.content or ""
+            parsed = _parse_hair_json(raw_text)
+
+            if parsed:
+                chars = HairCharacteristics(
+                    hair_length=parsed["hair_length"],
+                    hair_texture=parsed["hair_texture"],
+                    hair_density=parsed["hair_density"],
+                    hair_volume=parsed["hair_volume"],
+                )
                 return HairAnalysisResponse(
-                    hair_characteristics=vision_result,
-                    confidence=0.92,
-                    message="AI vision hair analysis completed using Groq model."
+                    hair_detected=True, hair_characteristics=chars
                 )
 
-            # Tier 2: OpenCV Fallback Analysis
-            try:
-                h, w, _ = img_bgr.shape
-                upper_region = img_bgr[0:int(h * 0.45), :]
-                gray_upper = cv2.cvtColor(upper_region, cv2.COLOR_BGR2GRAY)
+        except Exception as e:
+            logger.error(f"Groq hair analysis failed: {e}")
 
-                texture_score = cv2.Laplacian(gray_upper, cv2.CV_64F).var()
-                edges = cv2.Canny(gray_upper, 50, 150)
-                edge_density = np.sum(edges > 0) / float(edges.size)
-
-                side_region = img_bgr[int(h * 0.3):int(h * 0.8), :]
-                side_edges = cv2.Canny(side_region, 50, 150)
-                side_density = np.sum(side_edges > 0) / float(side_edges.size)
-
-                # Texture mapping
-                if edge_density > 0.18 or texture_score > 350:
-                    estimated_texture = "Curly"
-                elif edge_density > 0.11 or texture_score > 180:
-                    estimated_texture = "Wavy"
-                elif edge_density > 0.04:
-                    estimated_texture = "Straight"
-                else:
-                    estimated_texture = "Wavy"
-
-                # Length mapping
-                if side_density > 0.15:
-                    estimated_length = "Long"
-                elif side_density > 0.08:
-                    estimated_length = "Medium"
-                else:
-                    estimated_length = "Short"
-
-                # Density mapping
-                if edge_density > 0.12:
-                    estimated_density = "High"
-                elif edge_density > 0.05:
-                    estimated_density = "Medium"
-                else:
-                    estimated_density = "Low"
-
-                return HairAnalysisResponse(
-                    hair_characteristics=HairCharacteristics(
-                        hair_length=estimated_length,
-                        hair_texture=estimated_texture,
-                        hair_density=estimated_density,
-                        hair_volume="Medium"
-                    ),
-                    confidence=0.82,
-                    message="AI hair analysis completed via image feature heuristics."
-                )
-            except Exception as e:
-                logger.error(f"[HairAnalysisService] Fallback error: {e}")
-
-        # Default fallback response
+        # Fallback default values
+        fallback = HairCharacteristics(
+            hair_length="Medium",
+            hair_texture="Wavy",
+            hair_density="Medium",
+            hair_volume="Medium",
+        )
         return HairAnalysisResponse(
-            hair_characteristics=HairCharacteristics(
-                hair_length="Medium",
-                hair_texture="Wavy",
-                hair_density="Medium",
-                hair_volume="Medium"
-            ),
-            confidence=0.70,
-            message="Default hair characteristics estimated. You can adjust as desired."
+            hair_detected=True, hair_characteristics=fallback
         )
