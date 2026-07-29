@@ -1,0 +1,17 @@
+# Node & Next.js
+node_modules/
+.next/
+out/
+build/
+*.log
+
+# Python & Pytest
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+.env
+
+# OS Files
+.DS_Store
+Thumbs.db
