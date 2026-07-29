@@ -178,8 +178,8 @@ export async function getRecommendationsAPI(
 
 export async function requestVirtualTryOnAPI(
   imageFile: File,
-  hairstyleName: str,
-  promptHint: str = ''
+  hairstyleName: string,
+  promptHint: string = ''
 ): Promise<TryOnResponse> {
   const formData = new FormData();
   formData.append('file', imageFile);
